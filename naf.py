@@ -11,6 +11,9 @@ from keras import backend as K
 import theano.tensor as T
 import numpy as np
 from buffer import Buffer
+import RecordData as recordData
+import pdb
+import csv
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--batch_size', type=int, default=100)
@@ -28,7 +31,7 @@ parser.add_argument('--gamma', type=float, default=0.99)
 parser.add_argument('--tau', type=float, default=0.001)
 parser.add_argument('--episodes', type=int, default=200)
 parser.add_argument('--max_timesteps', type=int, default=200)
-parser.add_argument('--activation', choices=['tanh', 'relu'], default='tanh')
+parser.add_argument('--activation', choices=['tanh', 'relu'], default='relu')
 parser.add_argument('--optimizer', choices=['adam', 'rmsprop'], default='adam')
 parser.add_argument('--optimizer_lr', type=float, default=0.001)
 parser.add_argument('--noise', choices=['linear_decay', 'exp_decay', 'fixed', 'covariance'], default='linear_decay')
@@ -37,6 +40,7 @@ parser.add_argument('--display', action='store_true', default=True)
 parser.add_argument('--no_display', dest='display', action='store_false')
 parser.add_argument('--gym_record')
 parser.add_argument('environment')
+parser.add_argument('save_name')
 args = parser.parse_args()
 
 assert K._BACKEND == 'theano', "only works with Theano as backend"
@@ -178,15 +182,51 @@ V = lambda x: fV([0, x])
 target_model = Model(input=[x,u], output=q)
 target_model.set_weights(model.get_weights())
 
+SeedReplay = True
+if SeedReplay:
+  #load experience for initial buffer
+  filenames = ['Pendulum_Simple.csv'] #['Pendulum_Long.csv', 'Pendulum_simple.csv', 'Pendulum_Heavy.csv'] 
+  f_id = 0
+  for fn in filenames:
+    with open(fn, 'rb') as csv_file:
+      load_data = np.genfromtxt(csv_file, dtype = 'float')
+      try:
+        all_data = np.append(all_data, load_data, axis = 0)
+        model_id = np.append(model_id, np.full(len(all_data), f_id), axis = 0)
+      except:
+        all_data = load_data
+        model_id = np.full(len(all_data), f_id)
+    f_id += 1
+
+  pre_state = all_data[:,0:3]
+  action = all_data[:,3]
+  reward = all_data[:,4]
+  post_state = all_data[:,5:]
+
+
 # replay memory
 R = Buffer(args.replay_size, env.observation_space.shape, env.action_space.shape)
+fn = args.save_name #'Pendulum_Simple'
+RD = recordData.RecordData(fn + '.csv')
+
+if SeedReplay:
+  for i_buffer in range(args.replay_size): #adding the last N timesteps from expert training based on buffer size
+      indx = args.replay_size - i_buffer
+      preobs_b = pre_state[-indx, :]
+      action_b = np.array((action[-indx], ))
+      reward_b = np.array(reward[-indx])
+      postobs_b = post_state[-indx,:]
+      done_b = 0
+      R.add(preobs_b, action_b, reward_b, postobs_b, done_b)
 
 # the main learning loop
+episode_reward_hist = []
 total_reward = 0
 for i_episode in xrange(args.episodes):
     observation = env.reset()
     #print "initial state:", observation
     episode_reward = 0
+    RD.csv_state_reset()
     for t in xrange(args.max_timesteps):
         if args.display:
           env.render()
@@ -219,13 +259,16 @@ for i_episode in xrange(args.episodes):
         #print "Q(mu):", Q(x, np.array([u])), "Q(action):", Q(x, np.array([action]))
 
         # take the action and record reward
-        observation, reward, done, info = env.step(action)
+        preobs = observation
+        postobs, reward, done, info = env.step(action)
+        observation = postobs
         episode_reward += reward
         #print "reward:", reward
         #print "poststate:", observation
 
         # add experience to replay memory
         R.add(x[0], action, reward, observation, done)
+        RD.append(x[0], action, reward, postobs)
 
         loss = 0
         # perform train_repeat Q-updates
@@ -250,8 +293,14 @@ for i_episode in xrange(args.episodes):
 
     print "Episode {} finished after {} timesteps, reward {}".format(i_episode + 1, t + 1, episode_reward)
     total_reward += episode_reward
+    episode_reward_hist.append(episode_reward)
+    RD.write()
 
 print "Average reward per episode {}".format(total_reward / args.episodes)
+target_model.save(fn + '.hd5')
+with open(fn+'_episodeRs.csv', 'wb') as csv_file:
+  writer = csv.writer(csv_file, delimiter=' ')
+  writer.writerow(episode_reward_hist)
 
 if args.gym_record:
   env.monitor.close()
